@@ -1,5 +1,7 @@
 # opencode-api
 
+**English** | [中文](./README.zh.md)
+
 OpenAI-compatible API proxy for [opencode](https://opencode.ai) — exposes `opencode serve` as a standard `/v1/chat/completions` endpoint.
 
 ## Features
