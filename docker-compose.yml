@@ -1,0 +1,7 @@
+services:
+  opencode-api:
+    image: hk59775634/opencode-api:latest
+    ports:
+      - "80:80"
+    environment:
+      - API_KEY=${API_KEY:-} # 不设置API_KEY则免鉴权
