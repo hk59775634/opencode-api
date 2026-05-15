@@ -9,6 +9,7 @@ import asyncio
 import os
 import base64
 import re
+from io import BytesIO
 
 app = FastAPI()
 auth_scheme = HTTPBearer(auto_error=False)
@@ -65,9 +66,39 @@ def parse_model(model_str):
     return {"providerID": "opencode", "modelID": model_str}
 
 
+MIME_MAP = {
+    "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+    "gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp",
+}
+VISION_MODEL = "qwen3.6-plus-free"
+
+
+def url_to_data_url(url):
+    if url.startswith("data:"):
+        return url, detect_mime(url)
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    data = base64.b64encode(resp.content).decode()
+    content_type = resp.headers.get("Content-Type", "")
+    if not content_type or content_type == "application/octet-stream":
+        ext = url.rsplit(".", 1)[-1].lower() if "." in url else "png"
+        content_type = MIME_MAP.get(ext, "image/png")
+    return f"data:{content_type};base64,{data}", content_type
+
+
 def detect_mime(data_url):
     match = re.match(r"data:([^;]+)", data_url)
     return match.group(1) if match else "image/png"
+
+
+def has_image_content(messages):
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for item in content:
+                if item.get("type") == "image_url":
+                    return True
+    return False
 
 
 def convert_openai_content_to_parts(content):
@@ -80,16 +111,8 @@ def convert_openai_content_to_parts(content):
                 parts.append({"type": "text", "text": item["text"]})
             elif item.get("type") == "image_url":
                 url = item["image_url"]["url"]
-                if url.startswith("data:"):
-                    mime = detect_mime(url)
-                    parts.append({"type": "file", "mime": mime, "url": url})
-                else:
-                    mime = "image/png"
-                    ext = url.rsplit(".", 1)[-1].lower()
-                    mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
-                                "gif": "image/gif", "webp": "image/webp"}
-                    mime = mime_map.get(ext, "image/png")
-                    parts.append({"type": "file", "mime": mime, "url": url})
+                b64_url, mime = url_to_data_url(url)
+                parts.append({"type": "file", "mime": mime, "url": b64_url})
     return parts
 
 
@@ -115,6 +138,16 @@ async def do_chat_completion(messages, model_str, stream):
 
     if not last_user_parts:
         last_user_parts = [{"type": "text", "text": "hello"}]
+
+    has_image = any(
+        p.get("type") == "file" for p in last_user_parts
+    ) or any(
+        isinstance(h, list) and any(p.get("type") == "file" for p in h)
+        for h in history_texts
+    )
+
+    if has_image:
+        model_str = VISION_MODEL
 
     session_id = create_session()
 
