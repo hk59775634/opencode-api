@@ -10,9 +10,12 @@
 - **免费模型** — 仅列出 opencode 免费模型（`deepseek-v4-flash-free`、`qwen3.6-plus-free` 等）
 - **多轮对话** — 通过 `noReply` 消息保持上下文
 - **系统提示词** — 将 `system` 角色映射到 opencode 的系统提示词
-- **流式输出** — SSE 逐字符流式响应
+- **流式输出** — SSE 逐字符流式响应（聊天 & 文本补全）
+- **图片输入** — 支持 `image_url` 格式，适用于视觉模型
+- **文本补全** — 传统 `/v1/completions` 端点
 - **API 密钥认证** — 可选 `API_KEY` 环境变量用于 Bearer Token 鉴权
 - **模型映射** — 纯模型名自动补全为 `opencode/<model>` 提供商
+- **健康检查** — `GET /health` 和 `GET /`
 
 ## 快速开始
 
@@ -28,6 +31,13 @@ docker run -d -p 80:80 hk59775634/opencode-api:latest
 ```
 
 ## 使用示例
+
+### 健康检查
+
+```bash
+curl http://localhost:80/health
+# {"status":"ok","opencode":true}
+```
 
 ### 列出模型
 
@@ -51,6 +61,20 @@ curl -X POST http://localhost:80/v1/chat/completions \
   }'
 ```
 
+### 文本补全
+
+```bash
+curl -X POST http://localhost:80/v1/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-mykey" \
+  -d '{
+    "model": "deepseek-v4-flash-free",
+    "prompt": "从前有座山",
+    "max_tokens": 100,
+    "stream": false
+  }'
+```
+
 ### 流式输出
 
 ```bash
@@ -61,6 +85,25 @@ curl -N -X POST http://localhost:80/v1/chat/completions \
     "model": "deepseek-v4-flash-free",
     "messages": [{"role": "user", "content": "你好"}],
     "stream": true
+  }'
+```
+
+### 图片输入（视觉模型）
+
+```bash
+curl -X POST http://localhost:80/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.6-plus-free",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "text", "text": "这张图片里有什么？"},
+          {"type": "image_url", "image_url": {"url": "https://example.com/image.jpg"}}
+        ]
+      }
+    ]
   }'
 ```
 

@@ -7,6 +7,8 @@ import uuid
 import time
 import asyncio
 import os
+import base64
+import re
 
 app = FastAPI()
 auth_scheme = HTTPBearer(auto_error=False)
@@ -63,40 +65,38 @@ def parse_model(model_str):
     return {"providerID": "opencode", "modelID": model_str}
 
 
-@app.get("/v1/models")
-async def list_models(_=Depends(verify_auth)):
-    try:
-        resp = requests.get(f"{OPENCODE_URL}/provider", timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            providers = data.get("all", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-            models = []
-            for p in providers:
-                if p.get("id") != "opencode":
-                    continue
-                for mid in (p.get("models") or {}):
-                    models.append({
-                        "id": mid,
-                        "object": "model",
-                        "created": int(time.time()),
-                        "owned_by": "opencode",
-                    })
-            return {"object": "list", "data": models}
-    except requests.RequestException:
-        pass
-    return {"object": "list", "data": []}
+def detect_mime(data_url):
+    match = re.match(r"data:([^;]+)", data_url)
+    return match.group(1) if match else "image/png"
 
 
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request, _=Depends(verify_auth)):
-    data = await request.json()
-    messages = data.get("messages", [])
-    stream = data.get("stream", False)
-    model_str = data.get("model", "")
+def convert_openai_content_to_parts(content):
+    parts = []
+    if isinstance(content, str):
+        parts.append({"type": "text", "text": content})
+    elif isinstance(content, list):
+        for item in content:
+            if item.get("type") == "text":
+                parts.append({"type": "text", "text": item["text"]})
+            elif item.get("type") == "image_url":
+                url = item["image_url"]["url"]
+                if url.startswith("data:"):
+                    mime = detect_mime(url)
+                    parts.append({"type": "file", "mime": mime, "url": url})
+                else:
+                    mime = "image/png"
+                    ext = url.rsplit(".", 1)[-1].lower()
+                    mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                                "gif": "image/gif", "webp": "image/webp"}
+                    mime = mime_map.get(ext, "image/png")
+                    parts.append({"type": "file", "mime": mime, "url": url})
+    return parts
 
+
+async def do_chat_completion(messages, model_str, stream):
     system_message = ""
     history_texts = []
-    last_user = ""
+    last_user_parts = []
 
     for msg in messages:
         role = msg.get("role", "")
@@ -104,16 +104,17 @@ async def chat_completions(request: Request, _=Depends(verify_auth)):
         if role == "system":
             system_message = content
         elif role == "user":
-            if last_user:
-                history_texts.append(last_user)
-            last_user = content
+            if last_user_parts:
+                history_texts.append(last_user_parts)
+            last_user_parts = convert_openai_content_to_parts(content)
         elif role == "assistant":
-            history_texts.append(last_user)
-            history_texts.append(content)
-            last_user = ""
+            if last_user_parts:
+                history_texts.append(last_user_parts)
+            history_texts.append([{"type": "text", "text": content}])
+            last_user_parts = []
 
-    if not last_user:
-        last_user = "hello"
+    if not last_user_parts:
+        last_user_parts = [{"type": "text", "text": "hello"}]
 
     session_id = create_session()
 
@@ -124,11 +125,11 @@ async def chat_completions(request: Request, _=Depends(verify_auth)):
     if system_message:
         payload_base["system"] = system_message
 
-    def send_no_reply(text):
+    def send_no_reply(parts):
         try:
             requests.post(
                 f"{OPENCODE_URL}/session/{session_id}/message",
-                json={**payload_base, "parts": [{"type": "text", "text": text}], "noReply": True},
+                json={**payload_base, "parts": parts, "noReply": True},
                 timeout=30,
             )
         except requests.RequestException:
@@ -137,7 +138,7 @@ async def chat_completions(request: Request, _=Depends(verify_auth)):
     for text in history_texts:
         send_no_reply(text)
 
-    payload = {**payload_base, "parts": [{"type": "text", "text": last_user}]}
+    payload = {**payload_base, "parts": last_user_parts}
 
     try:
         resp = requests.post(
@@ -200,6 +201,116 @@ async def chat_completions(request: Request, _=Depends(verify_auth)):
             }],
             "usage": tokens,
         }
+
+
+@app.get("/health")
+@app.get("/")
+async def health():
+    try:
+        resp = requests.get(f"{OPENCODE_URL}/provider", timeout=5)
+        ok = resp.status_code == 200
+    except requests.RequestException:
+        ok = False
+    return {"status": "ok" if ok else "degraded", "opencode": ok}
+
+
+@app.get("/v1/models")
+async def list_models(_=Depends(verify_auth)):
+    try:
+        resp = requests.get(f"{OPENCODE_URL}/provider", timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            providers = data.get("all", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            models = []
+            for p in providers:
+                if p.get("id") != "opencode":
+                    continue
+                for mid in (p.get("models") or {}):
+                    models.append({
+                        "id": mid,
+                        "object": "model",
+                        "created": int(time.time()),
+                        "owned_by": "opencode",
+                    })
+            return {"object": "list", "data": models}
+    except requests.RequestException:
+        pass
+    return {"object": "list", "data": []}
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request, _=Depends(verify_auth)):
+    data = await request.json()
+    return await do_chat_completion(
+        messages=data.get("messages", []),
+        model_str=data.get("model", ""),
+        stream=data.get("stream", False),
+    )
+
+
+@app.post("/v1/completions")
+async def text_completions(request: Request, _=Depends(verify_auth)):
+    data = await request.json()
+    prompt = data.get("prompt", "")
+    if isinstance(prompt, list):
+        prompt = "\n".join(prompt)
+    stream = data.get("stream", False)
+    model_str = data.get("model", "")
+
+    messages = [{"role": "user", "content": prompt}]
+    result = await do_chat_completion(messages, model_str, False)
+
+    if stream:
+        text = result["choices"][0]["message"]["content"]
+
+        async def generate():
+            for char in text:
+                chunk = {
+                    "id": f"cmpl-{uuid.uuid4()}",
+                    "object": "text_completion",
+                    "created": int(time.time()),
+                    "model": model_str or "opencode",
+                    "choices": [{
+                        "text": char,
+                        "index": 0,
+                        "finish_reason": None,
+                        "logprobs": None,
+                    }],
+                }
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                await asyncio.sleep(0.005)
+            final = {
+                "id": f"cmpl-{uuid.uuid4()}",
+                "object": "text_completion",
+                "created": int(time.time()),
+                "model": model_str or "opencode",
+                "choices": [{
+                    "text": "",
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "logprobs": None,
+                }],
+            }
+            yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(generate(), media_type="text/event-stream")
+
+    text = result["choices"][0]["message"]["content"]
+    tokens = result.get("usage", {})
+    return {
+        "id": f"cmpl-{uuid.uuid4()}",
+        "object": "text_completion",
+        "created": int(time.time()),
+        "model": model_str or "opencode",
+        "choices": [{
+            "text": text,
+            "index": 0,
+            "finish_reason": "stop",
+            "logprobs": None,
+        }],
+        "usage": tokens,
+    }
 
 
 if __name__ == "__main__":
